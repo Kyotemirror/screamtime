@@ -1,37 +1,87 @@
 import pygame
 from datetime import datetime
 import math
+import json
+import os
 
 pygame.init()
 
 # -----------------
-# Window
+# Load config.json (with safe defaults)
 # -----------------
-WIDTH, HEIGHT = 480, 320
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Animated Clock (Per Digit)")
+DEFAULT_CONFIG = {
+    "display": {"fullscreen": False, "width": 480, "height": 320, "fps": 60},
+    "clock": {"format": "12hr", "show_ampm": True},
+    "animation": {
+        "digit_duration": 0.20,
+        "digit_slide_px": 18,
+        "digit_stagger": 0.04,
+        "ghost_bob_speed": 2.0,
+        "ghost_bob_height": 6
+    },
+    "colors": {"background": [10, 10, 20], "text": [240, 240, 240]},
+    "font": {
+        "name": "consolas",
+        "size": 64,
+        "bold": True,
+        "italic": False,
+        "antialias": True
+    }
+}
+
+def deep_merge(base, override):
+    """Merge dict override into base recursively."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+config_path = os.path.join(os.path.dirname(__file__), "config.json")
+CONFIG = DEFAULT_CONFIG
+if os.path.exists(config_path):
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_cfg = json.load(f)
+        CONFIG = deep_merge(DEFAULT_CONFIG, user_cfg)
+    except Exception as e:
+        print("Failed to load config.json, using defaults:", e)
+
+# -----------------
+# Display setup (fullscreen = one-line flag choice)
+# pygame.display.set_mode supports flags like pygame.FULLSCREEN [1](https://www.pygame.org/docs/ref/display.html)[2](https://www.pygame.org/docs/tut/DisplayModes.html)
+# -----------------
+DISPLAY = CONFIG["display"]
+WIDTH = int(DISPLAY.get("width", 480))
+HEIGHT = int(DISPLAY.get("height", 320))
+FPS = int(DISPLAY.get("fps", 60))
+
+FLAGS = pygame.FULLSCREEN if DISPLAY.get("fullscreen", False) else 0
+screen = pygame.display.set_mode((WIDTH, HEIGHT), FLAGS)
+pygame.display.set_caption("Animated Ghost Clock")
 
 clock = pygame.time.Clock()
 
 # -----------------
 # Colors
 # -----------------
-BG_COLOR = (10, 10, 20)
-WHITE = (240, 240, 240)
+BG_COLOR = tuple(CONFIG["colors"]["background"])
+TEXT_COLOR = tuple(CONFIG["colors"]["text"])
 
 # -----------------
-# System Font (monospace recommended for stable spacing)
-# pygame.font.SysFont uses installed system fonts. [1](https://www.pygame.org/docs/ref/font.html?highlight=antialiased)
+# System font
+# pygame.font.SysFont creates a Font from system fonts [3](https://www.pygame.org/docs/ref/font.html?highlight=sysfont)
 # -----------------
-FONT_NAME = "consolas"   # try: "consolas", "couriernew", "dejavusansmono"
-FONT_SIZE = 64
-FONT_BOLD = True
-FONT_ITALIC = False
+FONT_CFG = CONFIG["font"]
+FONT_NAME = FONT_CFG.get("name", None)  # can be string or list
+FONT_SIZE = int(FONT_CFG.get("size", 64))
+FONT_BOLD = bool(FONT_CFG.get("bold", True))
+FONT_ITALIC = bool(FONT_CFG.get("italic", False))
+ANTIALIAS = bool(FONT_CFG.get("antialias", True))
 
 font = pygame.font.SysFont(FONT_NAME, FONT_SIZE, bold=FONT_BOLD, italic=FONT_ITALIC)
-
-# antialias=True makes text smoother; False makes it more pixel-crisp. [2](https://petlja.github.io/TxtProgInPythonEng/03_PyGame/03_PyGame_24_Animation_Text.html)
-ANTIALIAS = True
 
 # -----------------
 # 8-bit Ghost Pixel Art (original)
@@ -53,35 +103,40 @@ def create_ghost_face(scale=4):
     for y, row in enumerate(pixels):
         for x, c in enumerate(row):
             if c == "X":
-                pygame.draw.rect(surf, WHITE, (x * scale, y * scale, scale, scale))
+                pygame.draw.rect(surf, TEXT_COLOR, (x * scale, y * scale, scale, scale))
     return surf
 
 ghost = create_ghost_face(scale=4)
 ghost_rect = ghost.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 55))
 
-# Ghost bob animation
+# -----------------
+# Animation config
+# -----------------
+ANIM = CONFIG["animation"]
+DIGIT_DURATION = float(ANIM.get("digit_duration", 0.20))
+DIGIT_SLIDE_PX = int(ANIM.get("digit_slide_px", 18))
+DIGIT_STAGGER = float(ANIM.get("digit_stagger", 0.04))
+
+BOB_SPEED = float(ANIM.get("ghost_bob_speed", 2.0))
+BOB_HEIGHT = int(ANIM.get("ghost_bob_height", 6))
 bob_t = 0.0
-BOB_SPEED = 2.0
-BOB_HEIGHT = 6
 
 # -----------------
-# Animation helpers
+# Helpers
 # -----------------
 def smoothstep(t: float) -> float:
-    # smooth ease-in-out (0..1)
     return t * t * (3 - 2 * t)
 
 # -----------------
 # Per-character animated slot
 # -----------------
 class CharSlot:
-    def __init__(self, char=" ", start_delay=0.0):
+    def __init__(self, char=" "):
         self.char = char
         self.old_char = char
         self.t = 1.0
         self.animating = False
         self.delay = 0.0
-        self.start_delay = start_delay
 
     def set_char(self, new_char, start_delay=0.0):
         if new_char != self.char:
@@ -95,7 +150,6 @@ class CharSlot:
         if not self.animating:
             return
 
-        # wait out the per-slot delay first (for a ripple effect)
         if self.delay > 0:
             self.delay -= dt
             return
@@ -106,25 +160,21 @@ class CharSlot:
             self.animating = False
 
     def draw(self, surface, x, y, cache, slide_px):
-        # get cached base surfaces
-        new_surf = cache.get(self.char)
-        old_surf = cache.get(self.old_char)
+        new_surf = cache[self.char]
+        old_surf = cache[self.old_char]
 
         if not self.animating or self.t >= 1.0 or self.delay > 0:
-            # steady state
             surface.blit(new_surf, (x, y))
             return
 
         tt = smoothstep(self.t)
 
-        # Old moves up & fades out; New moves up into place & fades in
         old_alpha = int(255 * (1 - tt))
         new_alpha = int(255 * tt)
 
         old_y = y - int(slide_px * tt)
         new_y = y + int(slide_px * (1 - tt))
 
-        # Copy so alpha doesn't affect cached surface
         old_draw = old_surf.copy()
         new_draw = new_surf.copy()
         old_draw.set_alpha(old_alpha)
@@ -134,37 +184,32 @@ class CharSlot:
         surface.blit(new_draw, (x, new_y))
 
 # -----------------
-# Animated text object (manages multiple CharSlots)
+# Animated text (multiple CharSlots)
 # -----------------
 class AnimatedText:
-    def __init__(self, initial_text, duration=0.22, slide_px=18, stagger=0.03):
+    def __init__(self, initial_text, duration, slide_px, stagger):
         self.duration = duration
         self.slide_px = slide_px
         self.stagger = stagger
         self.text = initial_text
 
-        # Build slots
         self.slots = [CharSlot(c) for c in initial_text]
-
-        # Cache rendered surfaces for speed
         self.cache = {}
         self._build_cache()
 
-        # Fixed slot width for stable layout
-        self.slot_w = max(self.cache[c].get_width() for c in self.cache)
-        self.slot_h = max(self.cache[c].get_height() for c in self.cache)
+        self.slot_w = max(s.get_width() for s in self.cache.values())
+        self.slot_h = max(s.get_height() for s in self.cache.values())
 
     def _build_cache(self):
-        # We will cache for all characters that might appear in time
-        # digits, colon, space, A,P,M
+        # Cache everything we might use in the time string
         allowed = set("0123456789: APM")
         for c in allowed:
-            surf = font.render(c, ANTIALIAS, WHITE)  # antialias flag is the 2nd argument. [2](https://petlja.github.io/TxtProgInPythonEng/03_PyGame/03_PyGame_24_Animation_Text.html)
+            surf = font.render(c, ANTIALIAS, TEXT_COLOR)  # render(text, antialias, color) [4](https://pytutorial.com/python-pygame-sysfont-text-rendering-guide/)
             self.cache[c] = surf.convert_alpha()
 
     def set_text(self, new_text):
-        # keep constant length to avoid layout shifts
         if len(new_text) != len(self.slots):
+            # Rebuild slots for new length
             self.slots = [CharSlot(c) for c in new_text]
             self.text = new_text
             return
@@ -184,35 +229,68 @@ class AnimatedText:
 
         for i, slot in enumerate(self.slots):
             x = start_x + i * self.slot_w
+            # Ensure character exists in cache (space, digits, :, A,P,M)
+            ch = slot.char
+            if ch not in self.cache:
+                # fallback render if something unexpected appears
+                self.cache[ch] = font.render(ch, ANTIALIAS, TEXT_COLOR).convert_alpha()
             slot.draw(surface, x, y, self.cache, self.slide_px)
 
 # -----------------
-# Format time as fixed-length 12hr string: " H:MM AM" style
-# (Two-hour slots so your layout doesn't jump at 9->10)
+# Time formatting driven by config
 # -----------------
+CLOCK_CFG = CONFIG["clock"]
+SHOW_AMPM = bool(CLOCK_CFG.get("show_ampm", True))
+FORMAT = str(CLOCK_CFG.get("format", "12hr")).lower()
+
 def get_time_string():
     now = datetime.now()
-    hh = now.strftime("%I")           # 01..12
-    mm = now.strftime("%M")
-    ap = now.strftime("%p")           # AM/PM
-    if hh[0] == "0":
-        hh = " " + hh[1]             # " 9" instead of "09"
-    return f"{hh}:{mm} {ap}"         # length is always 8 (e.g., " 9:42 PM")
 
-# Create animated text instance
-animated_clock = AnimatedText(get_time_string(), duration=0.20, slide_px=18, stagger=0.04)
+    if FORMAT == "24hr":
+        # fixed length: "HH:MM" (5)
+        return now.strftime("%H:%M")
+    else:
+        # 12hr
+        hh = now.strftime("%I")  # 01..12
+        mm = now.strftime("%M")
 
+        # Keep stable width: replace leading 0 with space
+        if hh[0] == "0":
+            hh = " " + hh[1]
+
+        if SHOW_AMPM:
+            ap = now.strftime("%p")  # AM/PM
+            # fixed length: " H:MM AM" (8)
+            return f"{hh}:{mm} {ap}"
+        else:
+            # fixed length: " H:MM" (5)
+            return f"{hh}:{mm}"
+
+# Create animated clock
+animated_clock = AnimatedText(
+    get_time_string(),
+    duration=DIGIT_DURATION,
+    slide_px=DIGIT_SLIDE_PX,
+    stagger=DIGIT_STAGGER
+)
+
+# -----------------
+# Main loop
+# -----------------
 running = True
 while running:
-    # tick() returns elapsed ms since last call; convert to seconds for dt. [3](https://www.pygame.org/docs/ref/time.html)
-    dt = clock.tick(60) / 1000.0
+    dt = clock.tick(FPS) / 1000.0
     bob_t += dt
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
 
-    # Update time string and trigger per-char animations
+        # Optional: ESC to quit (nice for fullscreen)
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            running = False
+
+    # Update time
     new_text = get_time_string()
     if new_text != animated_clock.text:
         animated_clock.set_text(new_text)
@@ -225,10 +303,8 @@ while running:
 
     # Draw
     screen.fill(BG_COLOR)
-
     screen.blit(ghost, ghost_rect)
 
-    # draw clock centered under ghost
     animated_clock.draw_centered(screen, WIDTH // 2, ghost_rect.bottom + 25)
 
     pygame.display.flip()
